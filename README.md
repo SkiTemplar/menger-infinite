@@ -6,11 +6,8 @@ precisión numérica, no un juego completo.
 
 ## Antecedente
 
-Proyecto OpenGL previo: `C:\Users\Rodrigo\CARRERA\ASIGNATURAS\PRGR-ProgGrafica\codigo\OpenGL\mengersponge`
-(raymarching en el fragment shader, pliegues `abs + sort`, *pre-folds* y repetición de dominio;
-ver `FRACTALS.md` y `src/main.cpp`).
 
-Allí el detalle se degradaba hacia el nivel 15. Hipótesis, pendiente de confirmar: precisión
+En una primera versión con raymarching en un fragment shader, el detalle se degradaba hacia el nivel 15. Hipótesis, pendiente de confirmar: precisión
 de `float32`. `3⁻¹⁵ ≈ 7·10⁻⁸` queda por debajo de la épsilon relativa de `float` en torno a 1
 (`1,19·10⁻⁷`), y el umbral de impacto del shader era `5e-8`. Pasado ese nivel, la posición de la
 cámara y las del rayo no se pueden representar a la escala del detalle. Añadir iteraciones o
