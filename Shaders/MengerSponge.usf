@@ -1,0 +1,316 @@
+// Esponja de Menger por raymarching a profundidad ilimitada.
+//
+// Base: fragment shader OpenGL de PRGR (mengersponge/src/main.cpp), con estas mejoras:
+// - sombra y AO con LOD por tamaño de rasgo en vez de MapLo: la esponja con menos pliegues contiene a la
+//   de más pliegues, así que los puntos dentro de agujeros pequeños nacían dentro de lo sólido y la
+//   sombra o la AO salían negras (manchas y rayas oscuras en los huecos);
+// - penumbra mejorada (Aaltonen), que estima el punto más cercano entre dos muestras del rayo de sombra;
+// - sphere tracing sobrerrelajado (Keinert et al. 2014) con retroceso si las esferas no se solapan;
+// - dithering antes de cuantizar para que el degradado del cielo no haga bandas.
+//
+// Profundidad: el rayo se recorre en unidades de vista, que el juego elige a la escala de la geometría
+// que se mira. El DE se evalúa en una cascada de marcos, ancestros de la celda de la cámara 6, 12, 18...
+// niveles más arriba (Menger::MakeRenderCascade): cada uno es un bloque de 3x3x3 celdas con máscara de
+// ocupación o el marco raíz con la esponja repetida. Cada muestra usa el marco más fino que la cubre;
+// sus coordenadas son del orden de 1, así que el error de float es relativo a la distancia y no depende
+// del nivel. La niebla es logarítmica en la distancia: deja ver la estructura de muchos niveles por encima.
+//
+// Ejes de UE (Z arriba). Se ejecuta tras el tonemapper: la salida ya lleva tonemap ACES y gamma propios.
+
+#include "/Engine/Public/Platform.ush"
+
+#ifndef MAX_FRAMES
+#define MAX_FRAMES 4
+#endif
+
+// xyz: cámara en el marco; w: unidades de marco por unidad de vista. Del más fino al más grueso.
+float4 FrameCamera[MAX_FRAMES];
+// x: máscara de ocupación del bloque; y: 1 si es el marco raíz repetido.
+uint4 FrameInfo[MAX_FRAMES];
+int NumFrames;
+// Distancia a la cámara, en unidades de marco, hasta la que un bloque conoce toda la geometría.
+float FrameReach;
+float3 CamRight;
+float3 CamUp;
+float3 CamForward;
+float2 TanHalfFov;
+float2 ViewRectMin;
+float2 ViewRectSize;
+int MaxSteps;
+int PreFolds;
+float FogStart;
+float FogLevels;
+float MaxDist;
+
+#define MAX_ITER 28
+#define PERIOD   4.0
+// Distancia (unidades de vista) a la que la sombra y la AO usan sus tamaños originales; más cerca se
+// escalan con t para que el sombreado no dependa del detalle que se esté mirando.
+#define REF_T    1.5
+// Factor de sobrerrelajación del sphere tracing; 1 es el sphere tracing clásico.
+#define RELAXATION 1.2
+// Un rasgo menor que esta fracción de la distancia recorrida por el rayo de sombra apenas cambia la penumbra.
+#define SHADOW_FEATURE_RATIO 0.02
+// Un rasgo menor que esta fracción de la altura de la muestra de AO apenas cambia la oclusión.
+#define AO_FEATURE_RATIO 0.1
+// Error de redondeo de las coordenadas del marco (del orden de 1): unos pocos ulp de float.
+#define FRAME_EPSILON 2.5e-7
+
+static float PixRad;
+
+float SdBox(float3 P, float3 B)
+{
+	const float3 D = abs(P) - B;
+	return min(max(D.x, max(D.y, D.z)), 0.0) + length(max(D, 0.0));
+}
+
+float MengerDE(float3 P, int Iterations)
+{
+	float S = 1.0;
+	[loop]
+	for (int i = 0; i < MAX_ITER; i++)
+	{
+		if (i >= Iterations) break;
+		P = abs(P);
+		if (P.x < P.y) P.xy = P.yx;
+		if (P.x < P.z) P.xz = P.zx;
+		if (P.y < P.z) P.yz = P.zy;
+		S *= 3.0;
+		P = P * 3.0 - 2.0;
+		if (P.z < -1.0) P.z += 2.0;
+	}
+	return SdBox(P, 1.0) / S;
+}
+
+/**
+ * DE en coordenadas de un marco. Espejo de Menger::FrameDistance (C++). En el bloque solo se miran las
+ * 8 celdas del octante más cercano: la geometría del resto está a 1 o más, de ahí la cota inicial.
+ */
+float FrameDE(float3 P, uint OccupancyMask, bool bTiled, int Iterations)
+{
+	if (bTiled)
+	{
+		return MengerDE(P - PERIOD * round(P / PERIOD), Iterations);
+	}
+
+	const float3 CellF = clamp(round(P * 0.5), -1.0, 1.0);
+	const int3 Cell = int3(CellF);
+	const int3 Side = int3(P - 2.0 * CellF >= 0.0) * 2 - 1;
+
+	float Best = 1.0;
+	[unroll]
+	for (int Corner = 0; Corner < 8; Corner++)
+	{
+		const int3 Candidate = Cell + Side * int3(Corner & 1, (Corner >> 1) & 1, (Corner >> 2) & 1);
+		const int Bit = (Candidate.x + 1) + 3 * (Candidate.y + 1) + 9 * (Candidate.z + 1);
+		if (any(abs(Candidate) > 1) || ((OccupancyMask >> uint(Bit)) & 1u) == 0u) continue;
+		const float3 InCell = P - 2.0 * float3(Candidate);
+		if (SdBox(InCell, 1.0) < Best)
+		{
+			Best = min(Best, MengerDE(InCell, Iterations));
+		}
+	}
+	return Best;
+}
+
+/** Marco más fino cuyo bloque conoce toda la geometría a esa distancia de la cámara (en unidades de vista). */
+int FrameIndexAt(float Distance)
+{
+	int Index = 0;
+	[loop]
+	while (Index < NumFrames - 1 && FrameInfo[Index].y == 0u && Distance * FrameCamera[Index].w > FrameReach)
+	{
+		Index++;
+	}
+	return Index;
+}
+
+/** Pliegues necesarios para resolver rasgos de tamaño FeatureSize en unidades de marco (celda = 2). */
+int IterationsForFrameSize(float FeatureSize)
+{
+	const float Ratio = 2.0 / max(FeatureSize, 1e-30);
+	const int N = (Ratio > 1.0) ? int(log(Ratio) / log(3.0)) + 1 : 1;
+	return clamp(N, 1, MAX_ITER);
+}
+
+/**
+ * DE en unidades de vista con la cámara en el origen, resolviendo rasgos de FeatureSize unidades de vista.
+ * El marco se elige por la distancia del punto a la cámara.
+ */
+float Map(float3 PView, float FeatureSize)
+{
+	const int Index = FrameIndexAt(length(PView));
+	const float4 Camera = FrameCamera[Index];
+	const uint4 Info = FrameInfo[Index];
+	const int Iterations = IterationsForFrameSize(FeatureSize * Camera.w);
+	return FrameDE(Camera.xyz + PView * Camera.w, Info.x, Info.y != 0u, Iterations) / Camera.w;
+}
+
+/** Tamaño de rasgo que pide un píxel a distancia T (PreFolds lo afina en factores de 3). */
+float LodSize(float T)
+{
+	return PixRad * max(T, 1e-7) * pow(3.0, -float(PreFolds));
+}
+
+/** Distancia mínima que distingue el float del marco usado a distancia T. */
+float MinHitDistance(float T)
+{
+	return FRAME_EPSILON / FrameCamera[FrameIndexAt(T)].w;
+}
+
+float2 March(float3 Rd)
+{
+	float T = 0.0;
+	float Omega = RELAXATION;
+	float StepLength = 0.0;
+	float PrevRadius = 0.0;
+	int i;
+	[loop]
+	for (i = 0; i < MaxSteps; i++)
+	{
+		const float Radius = Map(Rd * T, LodSize(T));
+		const float AbsRadius = abs(Radius);
+
+		// Si la esfera actual y la anterior no se solapan, el paso sobrerrelajado pudo saltarse
+		// la superficie: se deshace y se sigue con sphere tracing clásico.
+		const bool bOvershot = Omega > 1.0 && (AbsRadius + PrevRadius) < StepLength;
+		if (bOvershot)
+		{
+			StepLength -= Omega * StepLength;
+			Omega = 1.0;
+		}
+		else
+		{
+			if (Radius < max(MinHitDistance(T), PixRad * T * 0.2)) break;
+			StepLength = Radius * Omega;
+		}
+
+		PrevRadius = AbsRadius;
+		if (T > MaxDist) break;
+		T += StepLength;
+	}
+	return float2(T, float(i));
+}
+
+float3 CalcNormal(float3 P, float T, float HitSize)
+{
+	const float E = max(2.0 * MinHitDistance(T), PixRad * T * 0.3);
+	const float2 H = float2(1.0, -1.0);
+	return normalize(
+		H.xyy * Map(P + H.xyy * E, HitSize) + H.yyx * Map(P + H.yyx * E, HitSize) +
+		H.yxy * Map(P + H.yxy * E, HitSize) + H.xxx * Map(P + H.xxx * E, HitSize));
+}
+
+float CalcAO(float3 P, float3 N, float HitSize, float Scale)
+{
+	float Occlusion = 0.0;
+	float Weight = 1.0;
+	[unroll]
+	for (int i = 1; i <= 4; i++)
+	{
+		const float H = 0.015 * Scale * float(i);
+		Occlusion += (H - Map(P + H * N, max(HitSize, AO_FEATURE_RATIO * H))) * Weight;
+		Weight *= 0.55;
+	}
+	return saturate(1.0 - 5.0 * Occlusion / Scale);
+}
+
+float CalcShadow(float3 Ro, float3 Rd, float HitSize, float Scale)
+{
+	const float K = 16.0;
+	const float MaxT = 3.0 * Scale;
+	float Result = 1.0;
+	float PrevH = 1e10;
+	float T = 0.008 * Scale;
+	[loop]
+	for (int i = 0; i < 24; i++)
+	{
+		const float H = Map(Ro + Rd * T, max(HitSize, SHADOW_FEATURE_RATIO * T));
+		if (H < 0.0001 * Scale) return 0.0;
+
+		const float Y = H * H / (2.0 * PrevH);
+		const float D = sqrt(max(H * H - Y * Y, 0.0));
+		Result = min(Result, K * D / max(T - Y, 1e-12));
+		PrevH = H;
+
+		T += clamp(H, 0.003 * Scale, 0.25 * Scale);
+		if (T > MaxT) break;
+	}
+	return saturate(Result);
+}
+
+/** Niebla logarítmica: 0 hasta FogStart y 1 a FogStart · 3^FogLevels. */
+float LogFog(float T)
+{
+	const float Levels = log(max(T, FogStart) / FogStart) / log(3.0);
+	return saturate(Levels / FogLevels);
+}
+
+float3 Render(float3 Rd)
+{
+	const float2 Hit = March(Rd);
+	const float T = Hit.x;
+	const float StepRatio = Hit.y / float(MaxSteps);
+
+	float3 Sky = lerp(float3(0.02, 0.02, 0.05), float3(0.05, 0.08, 0.18), Rd.z * 0.5 + 0.5);
+	Sky += float3(0.015, 0.025, 0.06) * StepRatio;
+	if (T > MaxDist) return Sky;
+
+	const float Scale = clamp(T / REF_T, 1e-9, 1.0);
+	const float HitSize = LodSize(T);
+	const float3 P = Rd * T;
+	const float3 N = CalcNormal(P, T, HitSize);
+	const float3 Albedo = float3(0.52, 0.56, 0.64);
+	// Luz de OpenGL (0.6, 0.9, 0.4) con Y arriba, en ejes de UE (X = -z, Y = x, Z = y).
+	const float3 LightDir = normalize(float3(-0.4, 0.6, 0.9));
+	const float3 LightColor = float3(1.0, 0.95, 0.85);
+
+	const float Diffuse = max(dot(N, LightDir), 0.0);
+	const float3 ViewDir = -Rd;
+	const float Specular = pow(max(dot(N, normalize(LightDir + ViewDir)), 0.0), 48.0);
+	// Sin luz directa no hace falta trazar la sombra. Con if y no con ?:, que en HLSL puede evaluar ambas ramas.
+	float Shadow = 0.0;
+	[branch]
+	if (Diffuse > 0.0)
+	{
+		Shadow = CalcShadow(P + N * 0.003 * Scale, LightDir, HitSize, Scale);
+	}
+	const float AO = CalcAO(P, N, HitSize, Scale);
+	const float Hemi = 0.5 + 0.5 * N.z;
+	const float Fresnel = pow(1.0 - max(dot(ViewDir, N), 0.0), 4.0);
+
+	float3 C = 0.0;
+	C += Albedo * float3(0.04, 0.05, 0.08) * AO;
+	C += Albedo * float3(0.08, 0.10, 0.15) * Hemi * AO;
+	C += Albedo * LightColor * Diffuse * Shadow * AO;
+	C += LightColor * Specular * Shadow * 0.25;
+	C += Sky * Fresnel * 0.12;
+	C *= 1.0 - 0.2 * StepRatio;
+
+	return lerp(C, Sky, LogFog(T));
+}
+
+/** Interleaved gradient noise (Jimenez 2014): ruido estable por píxel en [0, 1). */
+float InterleavedGradientNoise(float2 Pixel)
+{
+	return frac(52.9829189 * frac(dot(Pixel, float2(0.06711056, 0.00583715))));
+}
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	// Coordenadas normalizadas del píxel en [-1, 1], con Y hacia arriba.
+	const float2 Uv = (SvPosition.xy - ViewRectMin) / ViewRectSize;
+	const float2 Ndc = float2(Uv.x * 2.0 - 1.0, 1.0 - Uv.y * 2.0);
+	PixRad = 2.0 * TanHalfFov.y / ViewRectSize.y;
+
+	const float3 Rd = normalize(CamForward + CamRight * (Ndc.x * TanHalfFov.x) + CamUp * (Ndc.y * TanHalfFov.y));
+	float3 Col = Render(Rd);
+
+	Col = Col * (2.51 * Col + 0.03) / (Col * (2.43 * Col + 0.59) + 0.14);
+	Col = pow(saturate(Col), 1.0 / 2.2);
+	const float2 Vignette = (Uv - 0.5) * 1.2;
+	Col *= 1.0 - 0.12 * dot(Vignette, Vignette);
+	Col += (InterleavedGradientNoise(SvPosition.xy) - 0.5) / 255.0;
+
+	OutColor = float4(Col, 1.0);
+}

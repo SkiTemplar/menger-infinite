@@ -8,6 +8,6 @@ public class MengerInfiniteEditorTarget : TargetRules
 		Type = TargetType.Editor;
 		DefaultBuildSettings = BuildSettingsVersion.V5;
 		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_6;
-		ExtraModuleNames.Add("MengerInfinite");
+		ExtraModuleNames.AddRange(new string[] { "MengerInfinite", "MengerInfiniteRender" });
 	}
 }

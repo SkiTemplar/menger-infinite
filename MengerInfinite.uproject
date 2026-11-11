@@ -5,6 +5,11 @@
 	"Description": "",
 	"Modules": [
 		{
+			"Name": "MengerInfiniteRender",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
 			"Name": "MengerInfinite",
 			"Type": "Runtime",
 			"LoadingPhase": "Default"
